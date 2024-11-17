@@ -2,116 +2,128 @@
 #include <DynamixelShield.h>
 #include <SoftwareSerial.h>
 
-#define DXL_SERIAL Serial
 SoftwareSerial soft_serial(7, 8); // DYNAMIXELShield UART RX/TX
-#define DEBUG_SERIAL soft_serial
 
-const uint8_t BROADCAST_ID = 254;
-const float DYNAMIXEL_PROTOCOL_VERSION = 1.0; // AX12A
-const uint8_t DXL_ID_CNT = 4;
-const uint8_t DXL_ID_LIST[DXL_ID_CNT] = {5, 6, 7, 8};
-const uint16_t user_pkt_buf_cap = 128;
-uint8_t user_pkt_buf[user_pkt_buf_cap];
+#define DXL_SERIAL Serial
+#define RASPBERRY_SERIAL soft_serial
+
+static const int32_t RASPBERRY_SERIAL_BAUD_RATE = 9600;
+
+static const float DYNAMIXEL_PROTOCOL_VERSION = 1.0; // AX12A
+static const int32_t DYNAMIXEL_BAUD_RATE = 1000000;  // AX12A use 1 Mbps baud rate
+static const uint8_t BROADCAST_ID = 254;
+
+static const uint8_t MOTORS_COUNT = 4;
+static const uint8_t MOTORS_ID_LIST[MOTORS_COUNT] = {
+    6, // FL
+    5, // FR
+    8, // RL
+    7, // RR
+};
 
 // Refer to: https://emanual.robotis.com/docs/en/dxl/ax/ax-12a/#control-table-of-ram-area
-// Starting address of the Data to write; Goal Position = 30 for AX12A
-const uint16_t SW_START_ADDR = 30;
-// Length of the Data to write; Length of Position data of AX12A is 2 bytes
-const uint16_t SW_ADDR_LEN = 2;
+// Starting address of the Data to write; Moving Speed = 32 for AX12A
+static const uint16_t MOVING_SPEED_START_ADDR = 32;
+// Length of the Data to write; Length of Speed data of AX12A is 2 bytes
+static const uint16_t MOVING_SPEED_ADDR_LEN = 2;
 
-typedef struct sw_data
+typedef struct sw_data_speed
 {
-  int16_t goal_position;
-} __attribute__((packed)) sw_data_t;
+  int16_t speed_goal;
+} __attribute__((packed)) sw_data_speed_t;
 
-sw_data_t sw_data[DXL_ID_CNT];
-DYNAMIXEL::InfoSyncWriteInst_t sw_infos;
-DYNAMIXEL::XELInfoSyncWrite_t info_xels_sw[DXL_ID_CNT];
+sw_data_speed_t sw_data_speed[MOTORS_COUNT];
+
+DYNAMIXEL::InfoSyncWriteInst_t sw_infos_speed;
+
+DYNAMIXEL::XELInfoSyncWrite_t info_xels_sw_speed[MOTORS_COUNT];
 
 DynamixelShield dxl;
 
 // This namespace is required to use DYNAMIXEL Control table item name definitions
 using namespace ControlTableItem;
 
-int16_t goal_position[2] = {250, 650}; // AX12A rotates between positions 250 and 550
+uint16_t values[MOTORS_COUNT];
+const uint8_t START_BYTE = 0xFF; // Start byte value
 
 void setup()
 {
-  // put your setup code here, to run once:
-  DEBUG_SERIAL.begin(115200);
+  RASPBERRY_SERIAL.begin(RASPBERRY_SERIAL_BAUD_RATE);
 
-  dxl.begin(1000000); // AX12A set to 1 Mbps
+  dxl.begin(DYNAMIXEL_BAUD_RATE);
   dxl.setPortProtocolVersion(DYNAMIXEL_PROTOCOL_VERSION);
 
-  for (uint16_t i = 0; i < DXL_ID_CNT; i++)
+  for (uint8_t i = 0; i < MOTORS_COUNT; i++)
   {
-    dxl.torqueOff(DXL_ID_LIST[i]);
-    dxl.setOperatingMode(DXL_ID_LIST[i], OP_POSITION);
+    dxl.torqueOff(MOTORS_ID_LIST[i]);
+    dxl.setOperatingMode(MOTORS_ID_LIST[i], OP_VELOCITY);
   }
+
   dxl.torqueOn(BROADCAST_ID);
 
   // Fill the members of structure to syncWrite using internal packet buffer
-  sw_infos.addr = SW_START_ADDR;
-  sw_infos.addr_length = SW_ADDR_LEN;
-  sw_infos.p_xels = info_xels_sw;
-  sw_infos.xel_count = 0;
-  sw_infos.packet.p_buf = nullptr;
-  sw_infos.packet.is_completed = false;
-  sw_infos.is_info_changed = true;
+  sw_infos_speed.addr = MOVING_SPEED_START_ADDR;
+  sw_infos_speed.addr_length = MOVING_SPEED_ADDR_LEN;
+  sw_infos_speed.p_xels = info_xels_sw_speed;
+  sw_infos_speed.xel_count = 0;
+  sw_infos_speed.packet.p_buf = nullptr;
+  sw_infos_speed.packet.is_completed = false;
+  sw_infos_speed.is_info_changed = true;
 
-  for (uint16_t i = 0; i < DXL_ID_CNT; i++)
+  for (uint8_t i = 0; i < MOTORS_COUNT; i++)
   {
-    info_xels_sw[i].id = DXL_ID_LIST[i];
-    info_xels_sw[i].p_data = (uint8_t *)&sw_data[i].goal_position;
-    sw_infos.xel_count++;
+    info_xels_sw_speed[i].id = MOTORS_ID_LIST[i];
+    info_xels_sw_speed[i].p_data = (uint8_t *)&sw_data_speed[i].speed_goal;
+    sw_infos_speed.xel_count++;
   }
-  sw_infos.is_info_changed = true;
 }
-
-uint8_t j = 0;
 
 void loop()
 {
-  static uint32_t try_count = 0;
+  static bool sync = false; // Track synchronization state
 
-  // Insert a new Goal Position to the SyncWrite Packet
-  for (uint16_t i = 0; i < DXL_ID_CNT; i++)
+  if (RASPBERRY_SERIAL.available())
   {
-    sw_data[i].goal_position = goal_position[j];
-  }
-
-  // Update the SyncWrite packet status
-  sw_infos.is_info_changed = true;
-
-  DEBUG_SERIAL.print("\n>>>>>> Sync Instruction Test : ");
-  DEBUG_SERIAL.println(try_count++);
-
-  // Build a SyncWrite Packet and transmit to DYNAMIXEL
-  if (dxl.syncWrite(&sw_infos) == true)
-  {
-    DEBUG_SERIAL.println("[SyncWrite] Success");
-    for (uint16_t i = 0; i < sw_infos.xel_count; i++)
+    if (!sync)
     {
-      DEBUG_SERIAL.print("  ID: ");
-      DEBUG_SERIAL.println(sw_infos.p_xels[i].id);
-      DEBUG_SERIAL.print("\t Goal Position: ");
-      DEBUG_SERIAL.println(sw_data[i].goal_position);
-    }
-    if (j == 0)
-    {
-      j = 1;
+      // Look for the start byte
+      if (RASPBERRY_SERIAL.read() == START_BYTE)
+      {
+        sync = true;
+      }
     }
     else
     {
-      j = 0;
+      // Wait until enough bytes are available
+      if (RASPBERRY_SERIAL.available() >= 8)
+      { // 4 values * 2 bytes each
+        for (int i = 0; i < 4; i++)
+        {
+          values[i] = RASPBERRY_SERIAL.read() | (RASPBERRY_SERIAL.read() << 8); // Combine two bytes into a 16-bit value
+        }
+        sync = false; // Reset synchronization after reading data
+
+        // Insert a new Velocity Goal to the SyncWrite Packet
+        for (uint8_t i = 0; i < MOTORS_COUNT; i++)
+        {
+          sw_data_speed[i].speed_goal = values[i];
+        }
+
+        // Update the SyncWrite packet status
+        sw_infos_speed.is_info_changed = true;
+
+        // Build a SyncWrite Packet and transmit to DYNAMIXEL
+        dxl.syncWrite(&sw_infos_speed);
+
+        RASPBERRY_SERIAL.print("m0: ");
+        RASPBERRY_SERIAL.print(values[0]);
+        RASPBERRY_SERIAL.print(", m1: ");
+        RASPBERRY_SERIAL.print(values[1]);
+        RASPBERRY_SERIAL.print(", m2: ");
+        RASPBERRY_SERIAL.print(values[2]);
+        RASPBERRY_SERIAL.print(", m3: ");
+        RASPBERRY_SERIAL.println(values[3]);
+      }
     }
   }
-  else
-  {
-    DEBUG_SERIAL.print("[SyncWrite] Fail, Lib error code: ");
-    DEBUG_SERIAL.print(dxl.getLastLibErrCode());
-  }
-  DEBUG_SERIAL.println();
-
-  delay(750);
 }
